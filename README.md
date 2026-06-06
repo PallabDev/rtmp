@@ -7,7 +7,7 @@ Small Node server for one private RTMP ingest and HLS playback.
 - Node.js 18+
 - FFmpeg installed and available as `ffmpeg`
 - Open ports:
-  - `3000` for the web dashboard and player
+  - `6789` for the web dashboard and player
   - `1935` for RTMP ingest
 
 ## Install
@@ -25,7 +25,7 @@ npm start
 Open:
 
 ```text
-http://localhost:3000
+http://localhost:6789
 ```
 
 Dashboard password:
@@ -40,6 +40,7 @@ The dashboard shows:
 - Stream key
 - Viewer page: `/play`
 - Direct HLS URL
+- Health check: `/health`
 
 ## OBS Settings
 
@@ -55,11 +56,12 @@ Use these settings for a low-resource 1 vCPU / 2 GB RAM server:
 - Audio bitrate: `128 Kbps`
 
 The server copies the incoming H.264/AAC stream into HLS, so OBS does the heavy encoding work.
+Do not use H.265/HEVC for this setup. Browser HLS playback will fail and `index.m3u8` may not be created.
 
 ## Environment Variables
 
 ```text
-PORT=3000
+PORT=6789
 RTMP_PORT=1935
 NMS_HTTP_PORT=8001
 PUBLIC_HOST=your-domain.com

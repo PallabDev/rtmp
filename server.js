@@ -12,13 +12,28 @@ const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HOSTNAME = process.env.PUBLIC_HOST || null;
 const DASHBOARD_PASSWORD = process.env.STREAM_PASSWORD || "stream@pallabdev";
 const COOKIE_SECRET = process.env.COOKIE_SECRET || "change-this-cookie-secret";
-const FFMPEG_PATH = process.env.FFMPEG_PATH || "ffmpeg";
 
 const rootDir = __dirname;
 const mediaDir = path.join(rootDir, "media");
 const keyFile = path.join(rootDir, ".stream-key");
 
 fs.mkdirSync(mediaDir, { recursive: true });
+
+function resolveFfmpegPath() {
+    const candidates = [
+        process.env.FFMPEG_PATH,
+        "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe",
+        "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg"
+    ].filter(Boolean);
+
+    const found = candidates.find((candidate) => fs.existsSync(candidate));
+    return found || process.env.FFMPEG_PATH || "ffmpeg";
+}
+
+const FFMPEG_PATH = resolveFfmpegPath();
 
 function loadStreamKey() {
     if (process.env.STREAM_KEY) return process.env.STREAM_KEY;
@@ -41,6 +56,20 @@ app.use(
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser(COOKIE_SECRET));
 app.use("/assets", express.static(path.join(rootDir, "public")));
+
+app.get("/health", (req, res) => {
+    const hlsFile = path.join(mediaDir, "rtmp", STREAM_KEY, "index.m3u8");
+    res.json({
+        ok: true,
+        webPort: WEB_PORT,
+        rtmpPort: RTMP_PORT,
+        streamKey: STREAM_KEY,
+        ffmpegPath: FFMPEG_PATH,
+        hlsReady: fs.existsSync(hlsFile),
+        hlsPath: `/hls/rtmp/${STREAM_KEY}/index.m3u8`
+    });
+});
+
 app.use(
     "/hls",
     express.static(mediaDir, {
@@ -51,6 +80,17 @@ app.use(
         }
     })
 );
+
+app.get("/hls/rtmp/:streamKey/index.m3u8", (req, res) => {
+    if (req.params.streamKey !== STREAM_KEY) {
+        return res.status(404).type("text/plain").send("Unknown stream key. Open /dashboard for the current key.");
+    }
+
+    return res
+        .status(404)
+        .type("text/plain")
+        .send("HLS is not ready yet. Start streaming with H.264 video and AAC audio, then wait a few seconds.");
+});
 
 function isLoggedIn(req) {
     return req.signedCookies.stream_admin === "ok";
@@ -167,7 +207,7 @@ app.get("/dashboard", requireLogin, (req, res) => {
       <div class="specs">
         <span>1280x720</span>
         <span>30 FPS</span>
-        <span>H.264</span>
+        <span>H.264 required</span>
         <span>AAC</span>
         <span>2500-3500 Kbps</span>
         <span>Keyframe 2s</span>
@@ -197,14 +237,24 @@ app.get("/play", (req, res) => {
 const video = document.getElementById("video");
 const statusEl = document.getElementById("status");
 const src = "${hlsPath}";
+let retryTimer = null;
 
 function setStatus(text) {
   statusEl.textContent = text;
 }
 
+function retrySoon(hls) {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    setStatus("Waiting for H.264/AAC stream...");
+    hls.loadSource(src + "?t=" + Date.now());
+  }, 2500);
+}
+
 if (video.canPlayType("application/vnd.apple.mpegurl")) {
   video.src = src;
-  setStatus("Playing with native HLS.");
+  video.addEventListener("loadedmetadata", () => setStatus("Stream is live."));
+  video.addEventListener("error", () => setStatus("Waiting for H.264/AAC stream..."));
 } else if (window.Hls && Hls.isSupported()) {
   const hls = new Hls({
     liveSyncDurationCount: 3,
@@ -215,7 +265,8 @@ if (video.canPlayType("application/vnd.apple.mpegurl")) {
   hls.attachMedia(video);
   hls.on(Hls.Events.MANIFEST_PARSED, () => setStatus("Stream is live."));
   hls.on(Hls.Events.ERROR, (_, data) => {
-    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) setStatus("Waiting for stream...");
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) retrySoon(hls);
+    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
   });
 } else {
   setStatus("This browser does not support HLS playback.");
@@ -244,9 +295,11 @@ const nms = new NodeMediaServer({
             {
                 app: "rtmp",
                 hls: true,
-                hlsFlags: "[hls_time=2:hls_list_size=6:hls_flags=delete_segments+append_list]",
+                hlsFlags: "[hls_time=2:hls_list_size=6:hls_flags=delete_segments+append_list+omit_endlist]",
                 ac: "copy",
-                vc: "copy"
+                vc: "copy",
+                acParam: [],
+                vcParam: []
             }
         ]
     }
@@ -268,4 +321,6 @@ app.listen(WEB_PORT, () => {
     console.log(`Dashboard: http://localhost:${WEB_PORT}`);
     console.log(`RTMP ingest: rtmp://localhost:${RTMP_PORT}/rtmp`);
     console.log(`Stream key: ${STREAM_KEY}`);
+    console.log(`FFmpeg: ${FFMPEG_PATH}`);
+    console.log("OBS must stream H.264 video + AAC audio. H.265/HEVC will not play in this low-CPU HLS mode.");
 });
