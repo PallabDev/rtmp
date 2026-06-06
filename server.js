@@ -37,6 +37,9 @@ const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HOSTNAME = process.env.PUBLIC_HOST || null;
 const DASHBOARD_PASSWORD = process.env.STREAM_PASSWORD || "stream@pallabdev";
 const COOKIE_SECRET = process.env.COOKIE_SECRET || "change-this-cookie-secret";
+const HLS_VIDEO_MODE = process.env.HLS_VIDEO_MODE || "transcode";
+const HLS_VIDEO_BITRATE = process.env.HLS_VIDEO_BITRATE || "2800k";
+const HLS_AUDIO_BITRATE = process.env.HLS_AUDIO_BITRATE || "128k";
 
 const rootDir = __dirname;
 const mediaDir = path.join(rootDir, "media");
@@ -100,32 +103,72 @@ function startHls(streamPath) {
 
     const outputFile = getHlsFile(streamName);
     const inputUrl = `rtmp://127.0.0.1:${RTMP_PORT}${streamPath}`;
+    const videoArgs =
+        HLS_VIDEO_MODE === "copy"
+            ? ["-c:v", "copy"]
+            : [
+                  "-c:v",
+                  "libx264",
+                  "-preset",
+                  "ultrafast",
+                  "-tune",
+                  "zerolatency",
+                  "-profile:v",
+                  "main",
+                  "-level",
+                  "4.0",
+                  "-pix_fmt",
+                  "yuv420p",
+                  "-vf",
+                  "scale=w=1280:h=720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30",
+                  "-b:v",
+                  HLS_VIDEO_BITRATE,
+                  "-maxrate",
+                  HLS_VIDEO_BITRATE,
+                  "-bufsize",
+                  "5600k",
+                  "-g",
+                  "60",
+                  "-keyint_min",
+                  "60",
+                  "-sc_threshold",
+                  "0"
+              ];
+
     const args = [
         "-hide_banner",
         "-loglevel",
         "warning",
         "-i",
         inputUrl,
-        "-c:v",
-        "copy",
+        ...videoArgs,
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        HLS_AUDIO_BITRATE,
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
         "-f",
         "hls",
         "-hls_time",
-        "2",
-        "-hls_list_size",
         "6",
+        "-hls_list_size",
+        "8",
+        "-hls_delete_threshold",
+        "8",
+        "-hls_allow_cache",
+        "0",
         "-hls_flags",
-        "delete_segments+append_list+omit_endlist",
+        "delete_segments+omit_endlist+independent_segments",
         "-hls_segment_filename",
         path.join(getStreamDir(streamName), "segment-%05d.ts"),
         outputFile
     ];
 
     console.log(`[hls] starting ffmpeg for ${streamPath}`);
+    console.log(`[hls] video mode ${HLS_VIDEO_MODE}`);
     console.log(`[hls] input ${inputUrl}`);
     console.log(`[hls] output ${outputFile}`);
 
@@ -200,6 +243,17 @@ app.get("/hls/rtmp/:streamKey/index.m3u8", (req, res) => {
         .status(404)
         .type("text/plain")
         .send("HLS is not ready yet. Start streaming with H.264 video and AAC audio, then wait a few seconds.");
+});
+
+app.get("/hls/rtmp/:streamKey/:segment", (req, res) => {
+    if (req.params.streamKey !== STREAM_KEY || !req.params.segment.endsWith(".ts")) {
+        return res.status(404).type("text/plain").send("Not found.");
+    }
+
+    return res
+        .status(404)
+        .type("text/plain")
+        .send("This live HLS segment is no longer available. Refresh /play to load the current playlist.");
 });
 
 function isLoggedIn(req) {
@@ -334,13 +388,13 @@ app.get("/play", (req, res) => {
     res.send(
         renderPage({
             title: "Live Stream",
-            extraHead: `<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>`,
+            extraHead: `<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js"></script>`,
             body: `<main class="player-shell">
   <header>
     <p class="eyebrow">Live now</p>
     <h1>PallabDev Stream</h1>
   </header>
-  <video id="video" controls autoplay muted playsinline></video>
+  <video id="video" controls autoplay muted playsinline preload="auto"></video>
   <p id="status" class="status">Waiting for stream...</p>
 </main>
 <script>
@@ -348,39 +402,100 @@ const video = document.getElementById("video");
 const statusEl = document.getElementById("status");
 const src = "${hlsPath}";
 let retryTimer = null;
+let hls = null;
 
 function setStatus(text) {
   statusEl.textContent = text;
 }
 
-function retrySoon(hls) {
+async function checkManifest() {
+  try {
+    const response = await fetch(src + "?t=" + Date.now(), { cache: "no-store" });
+    return response.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+function tryPlay() {
+  video.play().catch(() => {
+    setStatus("Click play to start the live stream.");
+  });
+}
+
+function retrySoon() {
   clearTimeout(retryTimer);
   retryTimer = setTimeout(() => {
-    setStatus("Waiting for H.264/AAC stream...");
-    hls.loadSource(src + "?t=" + Date.now());
+    startPlayer();
   }, 2500);
 }
 
-if (video.canPlayType("application/vnd.apple.mpegurl")) {
-  video.src = src;
-  video.addEventListener("loadedmetadata", () => setStatus("Stream is live."));
-  video.addEventListener("error", () => setStatus("Waiting for H.264/AAC stream..."));
-} else if (window.Hls && Hls.isSupported()) {
-  const hls = new Hls({
+async function startPlayer() {
+  const ready = await checkManifest();
+  if (!ready) {
+    setStatus("Waiting for HLS playlist...");
+    retrySoon();
+    return;
+  }
+
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = src + "?t=" + Date.now();
+    video.addEventListener("loadedmetadata", () => {
+      setStatus("Stream is live.");
+      tryPlay();
+    }, { once: true });
+    video.addEventListener("error", () => {
+      setStatus("Native HLS failed. Retrying...");
+      retrySoon();
+    }, { once: true });
+    return;
+  }
+
+  if (!window.Hls || !Hls.isSupported()) {
+    setStatus("HLS.js is not available in this browser.");
+    return;
+  }
+
+  if (hls) hls.destroy();
+  hls = new Hls({
+    enableWorker: true,
     liveSyncDurationCount: 3,
+    liveMaxLatencyDurationCount: 8,
     maxBufferLength: 12,
+    backBufferLength: 30,
     lowLatencyMode: false
   });
-  hls.loadSource(src);
+
   hls.attachMedia(video);
-  hls.on(Hls.Events.MANIFEST_PARSED, () => setStatus("Stream is live."));
-  hls.on(Hls.Events.ERROR, (_, data) => {
-    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) retrySoon(hls);
-    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+  hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+    hls.loadSource(src + "?t=" + Date.now());
   });
-} else {
-  setStatus("This browser does not support HLS playback.");
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    setStatus("Stream is live.");
+    tryPlay();
+  });
+  hls.on(Hls.Events.ERROR, (_, data) => {
+    if (!data.fatal) return;
+
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      setStatus("HLS network error. Retrying...");
+      retrySoon();
+      return;
+    }
+
+    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+      setStatus("Media error. Recovering...");
+      hls.recoverMediaError();
+      return;
+    }
+
+    setStatus("HLS player failed. Restart the stream and refresh.");
+    hls.destroy();
+    hls = null;
+  });
 }
+
+startPlayer();
 </script>`
         })
     );
