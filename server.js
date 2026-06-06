@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -69,6 +70,90 @@ function loadStreamKey() {
 }
 
 const STREAM_KEY = loadStreamKey();
+const hlsProcesses = new Map();
+
+function getStreamDir(streamName = STREAM_KEY) {
+    return path.join(mediaDir, "rtmp", streamName);
+}
+
+function getHlsFile(streamName = STREAM_KEY) {
+    return path.join(getStreamDir(streamName), "index.m3u8");
+}
+
+function cleanStreamFiles(streamName) {
+    const dir = getStreamDir(streamName);
+    fs.mkdirSync(dir, { recursive: true });
+
+    for (const file of fs.readdirSync(dir)) {
+        if (file.endsWith(".m3u8") || file.endsWith(".ts") || file.endsWith(".tmp")) {
+            fs.rmSync(path.join(dir, file), { force: true });
+        }
+    }
+}
+
+function startHls(streamPath) {
+    const parts = streamPath.split("/");
+    const streamName = parts[2];
+    if (!streamName || hlsProcesses.has(streamName)) return;
+
+    cleanStreamFiles(streamName);
+
+    const outputFile = getHlsFile(streamName);
+    const inputUrl = `rtmp://127.0.0.1:${RTMP_PORT}${streamPath}`;
+    const args = [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-i",
+        inputUrl,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-f",
+        "hls",
+        "-hls_time",
+        "2",
+        "-hls_list_size",
+        "6",
+        "-hls_flags",
+        "delete_segments+append_list+omit_endlist",
+        "-hls_segment_filename",
+        path.join(getStreamDir(streamName), "segment-%05d.ts"),
+        outputFile
+    ];
+
+    console.log(`[hls] starting ffmpeg for ${streamPath}`);
+    console.log(`[hls] input ${inputUrl}`);
+    console.log(`[hls] output ${outputFile}`);
+
+    const child = spawn(FFMPEG_PATH, args, { windowsHide: true });
+    hlsProcesses.set(streamName, child);
+
+    child.stderr.on("data", (data) => {
+        console.log(`[ffmpeg:${streamName}] ${data.toString().trim()}`);
+    });
+
+    child.on("error", (error) => {
+        console.error(`[hls] ffmpeg failed for ${streamName}: ${error.message}`);
+    });
+
+    child.on("close", (code, signal) => {
+        hlsProcesses.delete(streamName);
+        console.log(`[hls] ffmpeg stopped for ${streamName} code=${code} signal=${signal || "none"}`);
+    });
+}
+
+function stopHls(streamPath) {
+    const streamName = streamPath.split("/")[2];
+    const child = hlsProcesses.get(streamName);
+    if (!child) return;
+
+    console.log(`[hls] stopping ffmpeg for ${streamPath}`);
+    child.kill("SIGTERM");
+}
 
 const app = express();
 app.disable("x-powered-by");
@@ -82,13 +167,14 @@ app.use(cookieParser(COOKIE_SECRET));
 app.use("/assets", express.static(path.join(rootDir, "public")));
 
 app.get("/health", (req, res) => {
-    const hlsFile = path.join(mediaDir, "rtmp", STREAM_KEY, "index.m3u8");
+    const hlsFile = getHlsFile();
     res.json({
         ok: true,
         webPort: WEB_PORT,
         rtmpPort: RTMP_PORT,
         streamKey: STREAM_KEY,
         ffmpegPath: FFMPEG_PATH,
+        hlsRunning: hlsProcesses.has(STREAM_KEY),
         hlsReady: fs.existsSync(hlsFile),
         hlsPath: `/hls/rtmp/${STREAM_KEY}/index.m3u8`
     });
@@ -301,6 +387,7 @@ if (video.canPlayType("application/vnd.apple.mpegurl")) {
 });
 
 const nms = new NodeMediaServer({
+    logType: 2,
     rtmp: {
         port: RTMP_PORT,
         chunk_size: 60000,
@@ -312,20 +399,6 @@ const nms = new NodeMediaServer({
         port: Number(process.env.NMS_HTTP_PORT || 8001),
         mediaroot: mediaDir,
         allow_origin: "*"
-    },
-    trans: {
-        ffmpeg: FFMPEG_PATH,
-        tasks: [
-            {
-                app: "rtmp",
-                hls: true,
-                hlsFlags: "[hls_time=2:hls_list_size=6:hls_flags=delete_segments+append_list+omit_endlist]",
-                ac: "copy",
-                vc: "copy",
-                acParam: [],
-                vcParam: []
-            }
-        ]
     }
 });
 
@@ -337,6 +410,14 @@ nms.on("prePublish", (id, streamPath, args) => {
     if (parts[1] !== "rtmp" || streamName !== STREAM_KEY) {
         session.reject();
     }
+});
+
+nms.on("postPublish", (id, streamPath) => {
+    startHls(streamPath);
+});
+
+nms.on("donePublish", (id, streamPath) => {
+    stopHls(streamPath);
 });
 
 nms.run();
