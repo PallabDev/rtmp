@@ -5,6 +5,7 @@
   "description": "Small RTMP ingest and HLS playback server with a password protected stream dashboard.",
   "main": "server.js",
   "scripts": {
+    "postinstall": "node scripts/patch-node-media-server.js",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
